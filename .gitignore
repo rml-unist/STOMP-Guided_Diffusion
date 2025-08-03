@@ -144,7 +144,6 @@ logs
 
 *results
 
-
 *wandb
 
 
@@ -167,11 +166,10 @@ data_inference
 
 data_trajectories
 
+*isaacgym
 
 *.err
 *.out
-
-
 
 *.pickle
 

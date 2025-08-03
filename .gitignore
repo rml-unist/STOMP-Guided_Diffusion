@@ -178,3 +178,11 @@ data_trajectories
 *.pickle
 
 *tar.gz
+
+*.png
+
+*/results_inference
+
+*/vis
+
+*/log*

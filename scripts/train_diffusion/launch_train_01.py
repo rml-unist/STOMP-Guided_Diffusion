@@ -24,7 +24,6 @@ PARTITION = 'gpu' if USE_CUDA else 'amd3,amd2,amd'
 GRES = 'gpu:1' if USE_CUDA else None  # gpu:rtx2080:1, gpu:rtx3080:1, gpu:rtx3090:1, gpu:a5000:1
 CONDA_ENV = 'mpd'
 
-
 exp_name = f'train_diffusion'
 
 launcher = Launcher(

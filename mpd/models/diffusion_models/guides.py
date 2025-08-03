@@ -5,6 +5,7 @@ import einops
 import numpy as np
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from mp_baselines.planners.costs.cost_functions import CostGPTrajectory
 from mp_baselines.planners.costs.factors.mp_priors_multi import MultiMPPrior
@@ -170,13 +171,16 @@ class GuideManagerTrajectoriesWithVelocity(nn.Module):
         self.max_grad_norm = max_grad_norm
         self.max_grad_value = max_grad_value
 
-    def forward(self, x_normalized):
+    def forward(self, x_normalized, pred_noise=None, noise_scale=None):
         x = x_normalized.clone()
         with torch.enable_grad():
             x.requires_grad_(True)
 
             # unnormalize x
             # x is normalized, but the guides are defined on unnormalized trajectory space
+            if pred_noise is not None:
+                x = (x - noise_scale*pred_noise) / (torch.sqrt(1-noise_scale**2) + 1e-10)
+            
             x = self.dataset.unnormalize_trajectories(x)
 
             if self.interpolate_trajectories_for_collision:
@@ -184,10 +188,11 @@ class GuideManagerTrajectoriesWithVelocity(nn.Module):
                 x_interpolated = interpolate_points_v1(x, num_interpolated_points=self.num_interpolated_points_for_collision)
             else:
                 x_interpolated = x
-
+            
             # compute costs
             # append the current velocity trajectory to the position trajectory only for non-interpolated trajectories
             cost_l, weight_grad_cost_l = self.cost(x, x_interpolated=x_interpolated, return_invidual_costs_and_weights=True)
+
             grad = 0
             for cost, weight_grad_cost in zip(cost_l, weight_grad_cost_l):
                 if torch.is_tensor(cost):
@@ -196,17 +201,18 @@ class GuideManagerTrajectoriesWithVelocity(nn.Module):
                     grad_cost = torch.autograd.grad([cost.sum()], [x], retain_graph=True)[0]
 
                     # clip gradients
-                    grad_cost_clipped = self.clip_gradient(grad_cost)
+                    if self.clip_grad:
+                        grad_cost = self.clip_gradient(grad_cost)
 
                     # zeroing gradients at start and goal
-                    grad_cost_clipped[..., 0, :] = 0.
-                    grad_cost_clipped[..., -1, :] = 0.
+                    grad_cost[..., 0, :] = 0.
+                    grad_cost[..., -1, :] = 0.
 
                     # combine gradients
-                    grad_cost_clipped_weighted = weight_grad_cost * grad_cost_clipped
+                    grad_cost_clipped_weighted = weight_grad_cost * grad_cost
                     grad += grad_cost_clipped_weighted
 
-        # gradient ascent
+        # gradient descent
         grad = -1. * grad
         return grad
 
@@ -235,7 +241,147 @@ class GuideManagerTrajectoriesWithVelocity(nn.Module):
             grad = torch.clip(grad, -self.max_grad_value, self.max_grad_value)
         return grad
 
+class GuideManagerTrajectoriesWithSTOMP(nn.Module):
 
+    def __init__(self, dataset, cost, clip_grad=False, clip_grad_rule='norm', max_grad_norm=1., max_grad_value=0.1,
+                 interpolate_trajectories_for_collision=False,
+                 num_interpolated_points_for_collision=128,
+                 tensor_args=None,
+                 **kwargs):
+        super().__init__()
+        self.cost = cost
+        self.dataset = dataset
+
+        self.interpolate_trajectories_for_collision = interpolate_trajectories_for_collision
+        self.num_interpolated_points_for_collision = num_interpolated_points_for_collision
+
+        self.clip_grad = clip_grad
+        self.clip_grad_rule = clip_grad_rule
+        self.max_grad_norm = max_grad_norm
+        self.max_grad_value = max_grad_value
+        self.tensor_args=tensor_args
+
+    def forward(self, x_normalized, pred_noise, delta_noise, noise_scale, sample_num=10, temperature=1):
+        # x has 4 dim (sample_num, batch, traj_len, state_dim)
+        sample_num, batch, traj_len, state_dims = x_normalized.shape
+
+        # unnormalize x
+        # x is normalized, but the guides are defined on unnormalized trajectory space
+        x = (x_normalized - noise_scale*pred_noise) / (torch.sqrt(1-noise_scale**2) + 1e-10)# x0 prediction
+        
+        x = self.dataset.unnormalize_trajectories(x)
+        if self.interpolate_trajectories_for_collision:
+            # finer interpolation of trajectory for better collision avoidance
+            x_interpolated = interpolate_points_v1(x, num_interpolated_points=self.num_interpolated_points_for_collision)
+        else:
+            x_interpolated = x
+
+        # Compute costs : the main problem
+        cost = self.cost(x, x_interpolated=x_interpolated, return_invidual_costs_and_weights=False, aggregate=False)
+        # Ensure cost is a tensor and reshape it onces
+        if torch.is_tensor(cost):
+            cost = cost.view(sample_num, batch, traj_len, 1)
+
+            # Apply softmax and reshape noise in a single operation
+            prob = F.softmax(-cost / temperature, dim=0) #- 0.5
+            grad_samples = delta_noise.mul_(prob)  # Use element-wise multiplication directly
+
+            # Aggregate gradients while zeroing start and goal gradients in one step
+            grad_cost = grad_samples.sum(dim=0)
+            grad_cost[..., [0, -1], :] = 0.  # Zero gradients at the start and end
+
+        return grad_cost
+
+
+class GuideManagerTrajectoriesWithAdversary(nn.Module):
+
+    def __init__(self, dataset, cost, clip_grad=False, clip_grad_rule='norm', max_grad_norm=1., max_grad_value=0.1,
+                 interpolate_trajectories_for_collision=False,
+                 num_interpolated_points_for_collision=128,
+                 tensor_args=None,
+                 **kwargs):
+        super().__init__()
+        self.cost = cost
+        self.dataset = dataset
+
+        self.interpolate_trajectories_for_collision = interpolate_trajectories_for_collision
+        self.num_interpolated_points_for_collision = num_interpolated_points_for_collision
+
+        self.clip_grad = clip_grad
+        self.clip_grad_rule = clip_grad_rule
+        self.max_grad_norm = max_grad_norm
+        self.max_grad_value = max_grad_value
+        self.tensor_args=tensor_args
+
+    def forward(self, x_normalized, pred_noise, delta_noise, noise_logprob, noise_scale, sample_num=10, temperature=1):
+        # x has 4 dim (sample_num, batch, traj_len, state_dim)
+        sample_num, batch, traj_len, state_dims = x_normalized.shape
+        # x = x_normalized.clone()
+
+        x = (x_normalized - noise_scale*pred_noise) / torch.sqrt(1-noise_scale**2) # x0 prediction
+        # unnormalize x
+        # x is normalized, but the guides are defined on unnormalized trajectory space
+        x = self.dataset.unnormalize_trajectories(x_normalized)
+
+        if self.interpolate_trajectories_for_collision:
+            # finer interpolation of trajectory for better collision avoidance
+            x_interpolated = interpolate_points_v1(x, num_interpolated_points=self.num_interpolated_points_for_collision)
+        else:
+            x_interpolated = x
+
+        # compute costs
+        # append the current velocity trajectory to the position trajectory only for non-interpolated trajectories
+        cost = self.cost(x, x_interpolated=x_interpolated, return_invidual_costs_and_weights=False, aggregate=False)
+        noise_logprob = torch.softmax(noise_logprob, dim=0).view(sample_num, batch, traj_len, 1)
+        # print(noise_logprob.shape)
+
+        # Combine cost and weight_grad_cost directly in a more efficient loop
+        if torch.is_tensor(cost):
+            # Reshape and compute softmax in a single step
+            cost = cost.view(sample_num, batch, traj_len, 1)
+            
+            cost_logprob = F.softmax(-cost / temperature, dim=0) 
+            weight = noise_logprob - cost_logprob
+            # print(weight.max())
+
+            # Compute gradients using broadcasting to avoid repeated operations
+            grad_samples = delta_noise.mul_(weight)
+            grad_cost = grad_samples.sum(dim=0)
+
+            # Clip gradients using in-place operations
+            # grad_cost = self.clip_gradient(grad_cost)
+            
+            # Zero gradients at start and goal with a more efficient approach
+            grad_cost[..., [0, -1], :] = 0.  # Zero gradients at the start and end
+
+        # gradient ascent
+        # grad = -1. * grad_cost
+        return grad_cost
+
+    def clip_gradient(self, grad):
+        if self.clip_grad:
+            if self.clip_grad_rule == 'norm':
+                return self.clip_grad_by_norm(grad)
+            elif self.clip_grad_rule == 'value':
+                return self.clip_grad_by_value(grad)
+            else:
+                raise NotImplementedError
+        else:
+            return grad
+
+    def clip_grad_by_norm(self, grad):
+        # clip gradient by norm
+        if self.clip_grad:
+            grad_norm = torch.linalg.norm(grad + 1e-6, dim=-1, keepdims=True)
+            scale_ratio = torch.clip(grad_norm, 0., self.max_grad_norm) / grad_norm
+            grad = scale_ratio * grad
+        return grad
+
+    def clip_grad_by_value(self, grad):
+        # clip gradient by value
+        if self.clip_grad:
+            grad = torch.clip(grad, -self.max_grad_value, self.max_grad_value)
+        return grad
 
 
 class GuideBase(nn.Module, abc.ABC):

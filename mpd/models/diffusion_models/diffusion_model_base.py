@@ -16,8 +16,8 @@ from abc import ABC
 from torch.nn import DataParallel
 
 from mpd.models.diffusion_models.helpers import cosine_beta_schedule, Losses, exponential_beta_schedule
-from mpd.models.diffusion_models.sample_functions import extract, apply_hard_conditioning, guide_gradient_steps, \
-    ddpm_sample_fn
+from mpd.models.diffusion_models.sample_functions import extract, apply_hard_conditioning, mean_ddpm_sample_fn, \
+                                                            noise_ddpm_sample_fn, noise_ddim_sample_fn, resample_model_mean
 from torch_robotics.torch_utils.torch_timer import TimerCUDA
 from torch_robotics.torch_utils.torch_utils import to_numpy
 
@@ -101,7 +101,7 @@ class GaussianDiffusionModel(nn.Module, ABC):
                              betas * np.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod))
         self.register_buffer('posterior_mean_coef2',
                              (1. - alphas_cumprod_prev) * np.sqrt(alphas) / (1. - alphas_cumprod))
-
+        
         ## get loss coefficients and initialize objective
         self.loss_fn = Losses[loss_type]()
 
@@ -140,40 +140,83 @@ class GaussianDiffusionModel(nn.Module, ABC):
         posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def p_mean_variance(self, x, hard_conds, context, t):
+    def p_mean_variance(self, x, hard_conds, context, t, noise=None, return_recon=False):
         if context is not None:
             context = self.context_model(context)
 
-        x_recon = self.predict_start_from_noise(x, t=t, noise=self.model(x, t, context))
+        if noise is None:
+            noise = self.model(x, t, context)
+        x_recon = self.predict_start_from_noise(x, t=t, noise=noise)
 
         if self.clip_denoised:
             x_recon.clamp_(-1., 1.)
         else:
             assert RuntimeError()
 
+        if return_recon:
+            return x_recon
+
         model_mean, posterior_variance, posterior_log_variance = self.q_posterior(x_start=x_recon, x_t=x, t=t)
-        return model_mean, posterior_variance, posterior_log_variance
+        return model_mean, posterior_variance, posterior_log_variance, x_recon
 
     @torch.no_grad()
     def p_sample_loop(self, shape, hard_conds, context=None, return_chain=False,
-                      sample_fn=ddpm_sample_fn,
+                      sample_ver='mean_ddpm',
                       n_diffusion_steps_without_noise=0,
+                      x0=True,
+                      structured_noise=True,
+                      init_structured_noise=False,
+                      sampler=None,
+                      recurrencing=False,
+                      step_size=0.5,
+                      negative_step_size=0.5,
                       **sample_kwargs):
+        
         device = self.betas.device
+        if sample_ver=='mean_ddpm':
+            sample_fn=mean_ddpm_sample_fn
+        elif sample_ver=='noise_ddpm':
+            sample_fn=noise_ddpm_sample_fn
+        else:
+            raise NotImplementedError
 
         batch_size = shape[0]
-        x = torch.randn(shape, device=device)
-        x = apply_hard_conditioning(x, hard_conds)
+        if init_structured_noise:
+            x = sampler.sample((shape[0],)).reshape(shape)
+        else:
+            x = torch.randn(shape, device=device)
+        # No hard conditioning
 
-        chain = [x] if return_chain else None
+        chain = [] if return_chain else None
 
         for i in reversed(range(-n_diffusion_steps_without_noise, self.n_diffusion_steps)):
-            t = make_timesteps(batch_size, i, device)
-            x, values = sample_fn(self, x, hard_conds, context, t, **sample_kwargs)
+            if i >= 0:
+                t = make_timesteps(batch_size, i, device)
+            else:
+                t = torch.zeros_like(t)
+
+            # To guide nose
+            sqrt_one_minus_alpha_cumprod = extract(self.sqrt_one_minus_alphas_cumprod, t, x.shape)
+            x, values = sample_fn(self, x, hard_conds, context, t, 
+                                  noise_scale=sqrt_one_minus_alpha_cumprod, 
+                                  x0=x0,
+                                  sampler=sampler,
+                                  structured_noise=structured_noise, # True : SGDcosine
+                                  step_size=step_size,
+                                  negative_step_size=negative_step_size,
+                                  **sample_kwargs)
+            
+            if recurrencing and 0 >= i > -n_diffusion_steps_without_noise:
+                betas = extract(self.betas, t, x.shape)
+                x = torch.sqrt(1-betas)*x + torch.sqrt(betas)*torch.rand_like(x)
             x = apply_hard_conditioning(x, hard_conds)
 
             if return_chain:
-                chain.append(x)
+                if x0:
+                    values = apply_hard_conditioning(values, hard_conds)
+                    chain.append(values)
+                else:
+                    chain.append(x)
 
         if return_chain:
             chain = torch.stack(chain, dim=1)
@@ -183,74 +226,128 @@ class GaussianDiffusionModel(nn.Module, ABC):
 
     @torch.no_grad()
     def ddim_sample(
-        self, shape, hard_conds,
+        self, shape, hard_conds, 
         context=None, return_chain=False,
-        t_start_guide=torch.inf,
-        guide=None,
-        n_guide_steps=1,
-        **sample_kwargs,
+        recurrencing = False,
+        n_diffusion_steps_without_noise=0,
+        init_structured_noise=False,
+        structured_noise=False,
+        sampler=None,
+        x0=True,
+        time_jump=3,
+        **sample_kwargs
     ):
-        # Adapted from https://github.com/ezhang7423/language-control-diffusion/blob/63cdafb63d166221549968c662562753f6ac5394/src/lcd/models/diffusion.py#L226
+    
         device = self.betas.device
         batch_size = shape[0]
-        total_timesteps = self.n_diffusion_steps
-        sampling_timesteps = self.n_diffusion_steps // 5
-        eta = 0.
 
-        # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
-        times = torch.linspace(0, total_timesteps - 1, steps=sampling_timesteps + 1, device=device)
-        times = torch.cat((torch.tensor([-1], device=device), times))
-        times = list(reversed(times.int().tolist()))
-        time_pairs = list(zip(times[:-1], times[1:]))  # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
+        # times = torch.tensor([0]*n_diffusion_steps_without_noise + [0, 2, 4, 6, 8, 10, 12, 14, 16, 20, 24], device=device)
+        times = torch.tensor(list(range(self.n_diffusion_steps, 0, -time_jump), device=device) + [0]*n_diffusion_steps_without_noise, device=device)
+        time_pairs = list(zip(times[:-1], times[1:]))
 
-        x = torch.randn(shape, device=device)
-        x = apply_hard_conditioning(x, hard_conds)
-
+        if init_structured_noise:
+            x = sampler.sample((shape[0],)).reshape(shape)
+        else:
+            x = torch.randn(shape, device=device)
         chain = [x] if return_chain else None
 
         for time, time_next in time_pairs:
             t = make_timesteps(batch_size, time, device)
             t_next = make_timesteps(batch_size, time_next, device)
 
-            model_out = self.model(x, t, context)
-
-            x_start = self.predict_start_from_noise(x, t=t, noise=model_out)
-            pred_noise = self.predict_noise_from_start(x, t=t, x0=model_out)
-
-            if time_next < 0:
-                x = x_start
-                x = apply_hard_conditioning(x, hard_conds)
-                if return_chain:
-                    chain.append(x)
-                break
-
-            alpha = extract(self.alphas_cumprod, t, x.shape)
             alpha_next = extract(self.alphas_cumprod, t_next, x.shape)
+            sqrt_one_minus_alpha_cumprod = extract(self.sqrt_one_minus_alphas_cumprod, t, x.shape)
 
-            sigma = (
-                eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
-            )
-            c = (1 - alpha_next - sigma**2).sqrt()
+            x, values = noise_ddim_sample_fn(self, x, hard_conds, context, t, alpha_next,
+                                noise_scale=sqrt_one_minus_alpha_cumprod, 
+                                x0=x0,
+                                sampler=sampler,
+                                structured_noise=structured_noise,
+                                eta=0, # DDIM
+                                **sample_kwargs)
+            
+            if recurrencing and time < 2:
+                betas = extract(self.betas, t, x.shape)
+                x = torch.sqrt(1-betas)*x + torch.sqrt(betas)*torch.rand_like(x)
 
-            x = x_start * alpha_next.sqrt() + c * pred_noise
-
-            # guide gradient steps before adding noise
-            if guide is not None:
-                if torch.all(t_next < t_start_guide):
-                    x = guide_gradient_steps(
-                        x,
-                        hard_conds=hard_conds,
-                        guide=guide,
-                        **sample_kwargs
-                    )
-
-            # add noise
-            noise = torch.randn_like(x)
-            x = x + sigma * noise
             x = apply_hard_conditioning(x, hard_conds)
 
             if return_chain:
-                chain.append(x)
+                if x0:
+                    values = apply_hard_conditioning(values, hard_conds)
+                    chain.append(values)
+                else:
+                    chain.append(x)
+
+        if return_chain:
+            chain = torch.stack(chain, dim=1)
+            return x, chain
+
+        return x
+    
+    @torch.no_grad()
+    def re_ddpm_sample_loop(
+        self, shape, hard_conds, 
+        context=None, return_chain=False,
+        n_diffusion_steps_without_noise=0,
+        init_structured_noise=False,
+        structured_noise=False,
+        recurrencing=False,
+        sampler=None,
+        x0=True,
+        **sample_kwargs
+    ):
+        device = self.betas.device
+        batch_size = shape[0]
+
+        times = torch.tensor([0]*n_diffusion_steps_without_noise + list(range(0, self.n_diffusion_steps, 1)), device=device)
+        next_times = torch.tensor([0]*(n_diffusion_steps_without_noise + 1) + list(range(0, self.n_diffusion_steps-2, 1)), device=device)
+        times = list(reversed(times.int().tolist()))
+        next_times = list(reversed(next_times.int().tolist()))
+        time_pairs = list(zip(times, next_times))  # [(T-1, T-3), (T-2, T-4), ..., (1, 0), (0, 0), ..., (0, 0)]
+
+        if init_structured_noise:
+            x = sampler.sample((shape[0],)).reshape(shape)
+        else:
+            x = torch.randn(shape, device=device)
+
+        chain = [x] if return_chain else None
+        for time, time_next in time_pairs:
+            direct_forward = True
+            eta = 1
+
+            t = make_timesteps(batch_size, time, device)
+            t_next = make_timesteps(batch_size, time_next, device)
+
+            alpha_next = extract(self.alphas_cumprod, t_next, x.shape)
+            sqrt_one_minus_alpha_cumprod = extract(self.sqrt_one_minus_alphas_cumprod, t, x.shape)
+
+            x, values = noise_ddim_sample_fn(self, x, hard_conds, context, t, alpha_next,
+                                  noise_scale=sqrt_one_minus_alpha_cumprod, 
+                                  x0=x0,
+                                  sampler=sampler,
+                                  structured_noise=structured_noise,
+                                  eta=eta,
+                                  direct_forward=direct_forward,
+                                  **sample_kwargs)
+            
+            # recurrencing : go back in one time step.
+            if time >= 2: # edge cases
+                betas = extract(self.betas, t_next, x.shape)
+                x = torch.sqrt(1-betas)*x + torch.sqrt(betas)*torch.rand_like(x)
+
+            if recurrencing and time < 2:
+                betas = extract(self.betas, t, x.shape)
+                x = torch.sqrt(1-betas)*x + torch.sqrt(betas)*torch.rand_like(x)
+
+            x = apply_hard_conditioning(x, hard_conds)
+
+            if return_chain:
+                if x0:
+                    values = apply_hard_conditioning(values, hard_conds)
+                    chain.append(values)
+                else:
+                    chain.append(x)
 
         if return_chain:
             chain = torch.stack(chain, dim=1)
@@ -259,17 +356,199 @@ class GaussianDiffusionModel(nn.Module, ABC):
         return x
 
     @torch.no_grad()
-    def conditional_sample(self, hard_conds, horizon=None, batch_size=1, ddim=False, **sample_kwargs):
+    def diffusion_es_sample_loop(
+        self, shape, hard_conds, 
+        context=None, return_chain=False,
+        recurrencing = False,
+        n_diffusion_steps_without_noise=0,
+        structured_noise=False,
+        sampler=None,
+        x0=True,
+        time_jump=1,
+        loop_num=20,
+        cost=None,
+        **sample_kwargs
+    ):
+        assert cost is not None # check resample=True
+        # es doesn't utilize guidance
+        sample_kwargs.update({'gradient_free_guide_ver': None})
+        sample_kwargs.update({'guide': None})
+
+        device = self.betas.device
+        batch_size = shape[0]
+
+        last_time = make_timesteps(batch_size, torch.tensor(self.n_diffusion_steps-1, device=device), device)
+        times = torch.tensor(list(range(self.n_diffusion_steps-1, -1, -time_jump)) + [0]*n_diffusion_steps_without_noise, device=device)
+        time_pairs = list(zip(times[:-1], times[1:]))
+
+        if structured_noise:
+            x = sampler.sample((shape[0],)).reshape(shape)
+        else:
+            x = torch.randn(shape, device=device)
+        chain = [x] if return_chain else None
+
+        alpha_last = extract(self.alphas_cumprod, last_time, x.shape)
+        sqrt_one_minus_alpha_cumprod_last = extract(self.sqrt_one_minus_alphas_cumprod, last_time, x.shape)
+
+        for k in range(loop_num):
+            for i, times in enumerate(time_pairs):
+                time, time_next = times
+                t = make_timesteps(batch_size, time, device)
+                t_next = make_timesteps(batch_size, time_next, device)
+
+                alpha_next = extract(self.alphas_cumprod, t_next, x.shape)
+                sqrt_one_minus_alpha_cumprod = extract(self.sqrt_one_minus_alphas_cumprod, t, x.shape)
+
+                x, values = noise_ddim_sample_fn(self, x, hard_conds, context, t, alpha_next,
+                                    noise_scale=sqrt_one_minus_alpha_cumprod, 
+                                    x0=x0,
+                                    sampler=sampler,
+                                    structured_noise=False,
+                                    eta = 1 * (1-k/loop_num), # DDIM
+                                    **sample_kwargs)
+                if recurrencing and time < 2:
+                    betas = extract(self.betas, t, x.shape)
+                    x = torch.sqrt(1-betas)*x + torch.sqrt(betas)*torch.rand_like(x)
+
+                x = apply_hard_conditioning(x, hard_conds)
+
+                if return_chain:
+                    if x0:
+                        values = apply_hard_conditioning(values, hard_conds)
+                        if i == len(time_pairs) - 1:
+                            chain.append(values)
+                    else:
+                        if i == len(time_pairs) - 1:
+                            chain.append(x)
+                
+            # get x cost and sample
+            noise = torch.randn(shape, device=device)
+            x = resample_model_mean(cost, x, x, temperature=10)
+            x = torch.sqrt(alpha_last) * x + sqrt_one_minus_alpha_cumprod_last * noise
+
+            # last_time = make_timesteps(batch_size, torch.tensor(self.n_diffusion_steps * (1 - k/self.n_diffusion_steps)-1, device=device), device)
+            # times = torch.tensor(list(range(self.n_diffusion_steps-1, -1, -time_jump)) + [0]*n_diffusion_steps_without_noise, device=device)
+            # time_pairs = list(zip(times[:-1], times[1:]))
+
+            # alpha_last = extract(self.alphas_cumprod, last_time, x.shape)
+            # sqrt_one_minus_alpha_cumprod_last = extract(self.sqrt_one_minus_alphas_cumprod, last_time, x.shape)
+
+        if return_chain:
+            chain = torch.stack(chain, dim=1)
+            return x, chain
+
+        return x
+    
+    @torch.no_grad()
+    def diffusion_es_sample_loop_ver2(
+        self, shape, hard_conds, 
+        context=None, return_chain=False,
+        recurrencing = False,
+        n_diffusion_steps_without_noise=0,
+        structured_noise=False,
+        sampler=None,
+        x0=True,
+        time_jump=1,
+        loop_num=20,
+        cost=None,
+        **sample_kwargs
+    ):
+        # This function tries to follow author code at most.
+
+        assert cost is not None # check resample=True
+        # es doesn't utilize guidance
+        sample_kwargs.update({'gradient_free_guide_ver': None})
+        sample_kwargs.update({'guide': None})
+        sample_kwargs.update({'sample_ver':'noise_ddpm'})
+
+        device = self.betas.device
+        batch_size = shape[0]
+
+        x, init_chain = self.p_sample_loop(shape, hard_conds, context=context, return_chain=return_chain,
+                      n_diffusion_steps_without_noise=n_diffusion_steps_without_noise,
+                      x0=x0,
+                      structured_noise=False, 
+                      sampler=None,
+                      recurrencing=False,
+                      **sample_kwargs)
+        
+        chain = [init_chain] if return_chain else None
+        #mutate
+        max_mutate_timestep = 5
+        noise = torch.randn(shape, device=device)
+        mutate_time = make_timesteps(batch_size, torch.tensor(max_mutate_timestep-1, device=device), device)
+        alpha_mutate = extract(self.alphas_cumprod, mutate_time, x.shape)
+        sqrt_one_minus_alpha_cumprod_mutate = extract(self.sqrt_one_minus_alphas_cumprod, mutate_time, x.shape)
+        x = torch.sqrt(alpha_mutate) * x + sqrt_one_minus_alpha_cumprod_mutate * noise    
+
+        sample_kwargs.update({'noise_std_extra_schedule_fn':lambda x: 0.0})
+        for k in range(loop_num):
+            mutate_timestep = int(max_mutate_timestep * (1 - k/loop_num)) 
+            timestep_list = list(reversed(range(mutate_timestep)))
+            for tstep, i in enumerate(timestep_list):
+                if i >= 0:
+                    t = make_timesteps(batch_size, i, device)
+                else:
+                    t = torch.zeros_like(t)
+
+                # To guide nose
+                sqrt_one_minus_alpha_cumprod = extract(self.sqrt_one_minus_alphas_cumprod, t, x.shape)
+                x, values = noise_ddpm_sample_fn(self, x, hard_conds, context, t, 
+                                                noise_scale=sqrt_one_minus_alpha_cumprod, 
+                                                x0=x0,
+                                                sampler=sampler,
+                                                structured_noise=False,
+                                                **sample_kwargs)
+                
+                if recurrencing and 0 >= i > -n_diffusion_steps_without_noise:
+                    betas = extract(self.betas, t, x.shape)
+                    x = torch.sqrt(1-betas)*x + torch.sqrt(betas)*torch.rand_like(x)
+                x = apply_hard_conditioning(x, hard_conds)
+
+                if return_chain:
+                    if x0:
+                        if tstep == len(timestep_list) - 1:
+                            values = apply_hard_conditioning(values, hard_conds)
+                            chain.append(values.unsqueeze(1))
+                    else:
+                        chain.append(x.unsqueeze(1))
+
+            noise = torch.randn(shape, device=device)
+            mutate_time = make_timesteps(batch_size, torch.tensor(mutate_timestep-1, device=device), device)
+            alpha_mutate = extract(self.alphas_cumprod, mutate_time, x.shape)
+            sqrt_one_minus_alpha_cumprod_mutate = extract(self.sqrt_one_minus_alphas_cumprod, mutate_time, x.shape)
+
+            x = resample_model_mean(cost, x, x, temperature=1)
+            x = torch.sqrt(alpha_mutate) * x + sqrt_one_minus_alpha_cumprod_mutate * noise    
+
+        if return_chain:
+            chain = torch.concat(chain, dim=1)
+            return x, chain
+        
+        return x
+        
+    @torch.no_grad()
+    def conditional_sample(self, hard_conds, horizon=None, batch_size=1, time_sample_ver='ddpm', **sample_kwargs):
         '''
             hard conditions : hard_conds : { (time, state), ... }
         '''
         horizon = horizon or self.horizon
         shape = (batch_size, horizon, self.state_dim)
 
-        if ddim:
+        if time_sample_ver == 'ddim':
             return self.ddim_sample(shape, hard_conds, **sample_kwargs)
+        
+        elif time_sample_ver == 'ddpm_recurrencing':
+            return self.re_ddpm_sample_loop(shape, hard_conds, **sample_kwargs)
+        
+        elif time_sample_ver == 'ddpm':
+            return self.p_sample_loop(shape, hard_conds, **sample_kwargs)
 
-        return self.p_sample_loop(shape, hard_conds, **sample_kwargs)
+        elif time_sample_ver == 'diffusion-es':
+            return self.diffusion_es_sample_loop(shape, hard_conds, **sample_kwargs)
+        
+        else:
+            raise NotImplementedError
 
     def forward(self, cond, *args, **kwargs):
         raise NotImplementedError

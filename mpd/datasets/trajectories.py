@@ -15,7 +15,8 @@ from torch_robotics.tasks.tasks import PlanningTask
 from torch_robotics.visualizers.planning_visualizer import PlanningVisualizer
 
 repo = git.Repo('.', search_parent_directories=True)
-dataset_base_dir = os.path.join(repo.working_dir, 'data_trajectories')
+data_dir = '/nas_data/MPD/'
+dataset_base_dir = os.path.join(data_dir, 'data_trajectories')
 
 
 class TrajectoryDatasetBase(Dataset, abc.ABC):

@@ -144,7 +144,6 @@ logs
 
 *results
 
-data
 
 *wandb
 
@@ -172,7 +171,6 @@ data_trajectories
 *.err
 *.out
 
-*isaacgym
 
 
 *.pickle

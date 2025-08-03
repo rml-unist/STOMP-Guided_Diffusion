@@ -144,10 +144,10 @@ def experiment(
 
     # Todo : find the role of these variables
     latent_guide: bool = False, #False: Universal guidance
-    gradient_free_guide: bool = False, # True : STOMP
+    gradient_free_guide: bool = True, # True : STOMP
     gradient_free_guide_ver: str = 'STOMP', # 'STOMP', 'Adv'
 
-    resample: bool = True,
+    resample: bool = False,
     guidance_sample: int = 15, # 2d: 5, panda: 15
     start_guide_steps_fraction: float = 1, 
     n_guide_steps: int = 1,
@@ -648,13 +648,12 @@ def experiment(
                     **results_data_dict,
                 )
                 motion_planning_controller = MotionPlanningController(motion_planning_isaac_env)
-
-                motion_planning_controller.render_trajectory_positions(isaac_best_traj_pos,
+                motion_planning_controller.render_trajectory_positions(best_traj_pos,
                                                                     save_path=os.path.join(results_dir, f'{base_file_name}-isaac-trajectory.png'))
 
-                fig, ax = planner_visualizer.render_robot_trajectories(traj_best=isaac_best_traj_pos,
-                                                                    start_state=isaac_best_traj_pos[0],
-                                                                    goal_state=isaac_best_traj_pos[-1])
+                fig, ax = planner_visualizer.render_robot_trajectories(traj_best=best_traj_pos,
+                                                                    start_state=best_traj_pos[0],
+                                                                    goal_state=best_traj_pos[-1])
                 # For 75
                 ax.view_init(elev=65, azim=60)
                 ax.dist=7

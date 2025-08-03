@@ -673,6 +673,7 @@ class MotionPlanningController:
             self,
             trajectories,  # shape: (H, B, D)
             start_states_joint_pos=None, goal_state_joint_pos=None,
+            start_states_base_pos=None, goal_state_base_pos=None,
             n_first_steps=0,
             n_last_steps=0,
             visualize=True,
@@ -689,7 +690,12 @@ class MotionPlanningController:
         trajectories_copy = trajectories.clone()
 
         # start at the initial position
-        joint_states = self.mp_env.reset(start_joint_positions=start_states_joint_pos, goal_joint_position=goal_state_joint_pos)
+        if isinstance(self.mp_env.robot, RobotPanda):
+             joint_states = self.mp_env.reset(start_joint_positions=start_states_joint_pos, goal_joint_position=goal_state_joint_pos)
+        else:
+            joint_states = self.mp_env.reset(start_joint_positions=start_states_joint_pos, goal_joint_position=goal_state_joint_pos,
+                                             start_states_base_pos=start_states_base_pos, goal_state_base_pos=goal_state_base_pos)
+   
 
         # first steps -- keep robots in place
         joint_positions_start = joint_states[:, :, 0]
@@ -697,9 +703,6 @@ class MotionPlanningController:
         for _ in range(n_first_steps):
             if self.mp_env.check_viewer_has_closed():
                 break
-            joint_states, envs_with_robot_in_contact = self.mp_env.step(actions, visualize=visualize, render_viewer_camera=render_viewer_camera)
-            envs_with_robot_in_contact_l.append(envs_with_robot_in_contact)
-
             if self.mp_env.controller_type == 'position':
                 _, _ = self.mp_env.step(joint_positions_start, visualize=visualize, render_viewer_camera=render_viewer_camera)
             elif self.mp_env.controller_type == 'velocity':

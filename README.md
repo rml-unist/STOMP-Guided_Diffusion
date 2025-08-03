@@ -9,8 +9,8 @@ Pre-requisites:
 Clone this repository with
 ```bash
 cd ~
-git clone --recurse-submodules https://github.com/jacarvalho/mpd-public.git
-cd mpd-public
+git clone https://github.com/rml-unist/STOMP-Guided_Diffusion.git
+cd STOMP-Guided_Diffusion
 ```
 
 Download [IsaacGym Preview 4](https://developer.nvidia.com/isaac-gym) and extract it under `deps/isaacgym`
@@ -40,6 +40,12 @@ gdown --id 1mmJAFg6M2I1OozZcyueKp_AP0HHkCq2k
 tar -xvf data_trajectories.tar.gz
 gdown --id 1I66PJ5QudCqIZ2Xy4P8e-iRBA8-e2zO1
 tar -xvf data_trained_models.tar.gz
+```
+
+After downloading, please change the below variables
+```
+TRAINED_MODELS_DIR (scripts/inference/inference.py)
+data_dir (mpd/datasets/trajectories.py)
 ```
 
 Run the inference script

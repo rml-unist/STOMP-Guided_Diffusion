@@ -57,6 +57,11 @@ model_id: str = 'EnvSpheres3D-RobotPanda'
 ```
 The results will be saved under `data_trained_models/[model_id]/results_inference/`.
 
+To run multiple experiment, use the below command
+```bash
+python ./scripts/inference/launch_test.py
+```
+
 ---
 ## Credits
 

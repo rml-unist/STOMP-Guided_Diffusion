@@ -483,7 +483,7 @@ class GaussianDiffusionModel(nn.Module, ABC):
 
         sample_kwargs.update({'noise_std_extra_schedule_fn':lambda x: 0.0})
         for k in range(loop_num):
-            mutate_timestep = int(max_mutate_timestep * (1 - k/loop_num)) 
+            mutate_timestep = max(int(max_mutate_timestep * (1 - k/loop_num)), 1)
             timestep_list = list(reversed(range(mutate_timestep)))
             for tstep, i in enumerate(timestep_list):
                 if i >= 0:
@@ -518,7 +518,7 @@ class GaussianDiffusionModel(nn.Module, ABC):
             alpha_mutate = extract(self.alphas_cumprod, mutate_time, x.shape)
             sqrt_one_minus_alpha_cumprod_mutate = extract(self.sqrt_one_minus_alphas_cumprod, mutate_time, x.shape)
 
-            x = resample_model_mean(cost, x, x, temperature=1)
+            x = resample_model_mean(cost, x, x, temperature=10)
             x = torch.sqrt(alpha_mutate) * x + sqrt_one_minus_alpha_cumprod_mutate * noise    
 
         if return_chain:
@@ -546,6 +546,7 @@ class GaussianDiffusionModel(nn.Module, ABC):
 
         elif time_sample_ver == 'diffusion-es':
             return self.diffusion_es_sample_loop(shape, hard_conds, **sample_kwargs)
+            # return self.diffusion_es_sample_loop_ver2(shape, hard_conds, **sample_kwargs)
         
         else:
             raise NotImplementedError

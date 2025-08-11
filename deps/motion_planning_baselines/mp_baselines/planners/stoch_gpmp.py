@@ -11,6 +11,7 @@ from mp_baselines.planners.costs.factors.mp_priors_multi import MultiMPPrior
 from mp_baselines.planners.costs.factors.unary_factor import UnaryFactor
 from mp_baselines.planners.gpmp2 import build_gpmp2_cost_composite
 
+from torch_robotics.torch_utils.torch_timer import TimerCUDA
 
 class StochGPMP(OptimizationPlanner):
 
@@ -31,7 +32,7 @@ class StochGPMP(OptimizationPlanner):
             sigma_goal_init=None,
             sigma_goal_sample=None,
             sigma_gp_init=None,
-            sigma_gp_sample=None,
+            sigma_gp =None,
             num_samples=2,
             temperature=1.,
             **kwargs
@@ -67,7 +68,7 @@ class StochGPMP(OptimizationPlanner):
         self.temperature = temperature
         self.sigma_start_sample = sigma_start_sample
         self.sigma_goal_sample = sigma_goal_sample
-        self.sigma_gp_sample = sigma_gp_sample
+        self.sigma_gp_sample = sigma_gp
 
         self._mean = None
         self._weights = None
@@ -233,12 +234,12 @@ class StochGPMP(OptimizationPlanner):
         )
 
     def _get_costs(self, **observation):
-        costs = self.cost.eval(self.state_samples, **observation).reshape(self.num_particles, self.num_samples)
+        costs = self.temperature * self.cost.eval(self.state_samples, **observation).reshape(self.num_particles, self.num_samples)
 
         # Add cost from importance-sampling ratio
-        V = self.state_samples.view(-1, self.num_samples, self.n_support_points * self.d_state_opt)  # flatten trajectories
-        U = self._particle_means.view(-1, 1, self.n_support_points * self.d_state_opt)
-        costs += self.temperature * (V @ self.Sigma_inv @ U.transpose(1, 2)).squeeze(2)
+        # V = self.state_samples.view(-1, self.num_samples, self.n_support_points * self.d_state_opt)  # flatten trajectories
+        # U = self._particle_means.view(-1, 1, self.n_support_points * self.d_state_opt)
+        # costs -= 0.5*(V @ self.Sigma_inv @ U.transpose(1, 2)).squeeze(2)
         return costs
 
     def sample_and_eval(self, **observation):
@@ -288,15 +289,17 @@ class StochGPMP(OptimizationPlanner):
         if opt_iters is None:
             opt_iters = self.opt_iters
 
-        for opt_step in range(opt_iters):
+        with TimerCUDA() as t:
             with torch.no_grad():
-                (control_samples,
-                 state_trajectories,
-                 control_particles,
-                 state_particles,
-                 costs,) = self.sample_and_eval(**observation)
+                for opt_step in range(opt_iters):
+                    # self.step_size = self.step_size * (1 - opt_step) / opt_iters
+                    (control_samples,
+                    state_trajectories,
+                    control_particles,
+                    state_particles,
+                    costs,) = self.sample_and_eval(**observation)
 
-                approx_grad = self._update_distribution(costs, self.state_samples)
+                    approx_grad = self._update_distribution(costs, self.state_samples)
 
         self._recent_control_samples = control_samples
         self._recent_control_particles = control_particles
@@ -306,7 +309,7 @@ class StochGPMP(OptimizationPlanner):
 
         # get mean trajectory
         curr_traj = self._get_traj()
-        return curr_traj
+        return curr_traj, t.elapsed
 
     # def _get_traj(self, mode='best'):
     #     if mode == 'best':

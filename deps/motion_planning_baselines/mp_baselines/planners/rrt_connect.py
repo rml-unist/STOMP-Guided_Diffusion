@@ -12,6 +12,24 @@ from mp_baselines.planners.rrt_base import RRTBase
 from mp_baselines.planners.utils import safe_path, purge_duplicates_from_traj, extend_path
 from torch_robotics.torch_utils.torch_timer import TimerCUDA
 
+# --- add near imports ---
+from collections import defaultdict
+import contextlib
+import torch
+
+@contextlib.contextmanager
+def prof_range(name, timers=None):
+    if torch.cuda.is_available():
+        torch.cuda.nvtx.range_push(name)
+    t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        dt = time.perf_counter() - t0
+        if timers is not None:
+            timers[name] += dt
+        if torch.cuda.is_available():
+            torch.cuda.nvtx.range_pop()
 
 class TreeNode:
 
@@ -90,7 +108,7 @@ class RRTConnect(RRTBase):
         self.nodes_tree_1_torch = None
         self.nodes_tree_2_torch = None
 
-    def _run_optimization(self, opt_iters, **observation):
+    def _run_optimization(self, opt_iters, return_stat=False, **observation):
         """
         Run optimization iterations.
         """
@@ -177,19 +195,32 @@ class RRTConnect(RRTBase):
                         n1, n2 = n2, n1
 
                     path1, path2 = n1.retrace(), n2.retrace()
-
-                    # if swap:
-                    #     path1, path2 = path2, path1
-
                     path = configs(path1[:-1] + path2[::-1])
                     break
-
-        if path is not None:
-            if len(path) == 1:
-                return None
-            self.print_info(iteration, t.elapsed, success)
+        
+        self.print_info(iteration, t.elapsed, success)
+        if success:
+            if return_stat:
+                return purge_duplicates_from_traj(path, eps=1e-6), t.elapsed
             return purge_duplicates_from_traj(path, eps=1e-6)
-        return path
+        else:
+            if return_stat:
+                return None, t.elapsed
+            return None
+
+        # if path is not None:
+        #     if len(path) == 1:
+        #         if return_stat:
+        #             return None, t.elapsed
+        #         return None
+        #     self.print_info(iteration, t.elapsed, success)
+        #     if return_stat:
+        #         return purge_duplicates_from_traj(path, eps=1e-6), t.elapsed
+        #     return purge_duplicates_from_traj(path, eps=1e-6)
+        # if return_stat:
+        #     print(path, t.elapsed)
+        #     return path, t.elapsed
+        # return path
 
     def print_info(self, iteration, elapsed_time, success):
         print(f'Iteration: {iteration:5}/{self.n_iters:5} '

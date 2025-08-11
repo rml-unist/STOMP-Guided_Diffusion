@@ -29,6 +29,7 @@ def build_gpmp2_cost_composite(
     num_particles_per_goal=None,
     collision_fields=None,
     extra_costs=[],
+    weights_cost_list=None,
     sigma_start=1e-5,
     sigma_gp=1e-2,
     sigma_coll=1e-5,
@@ -84,14 +85,12 @@ def build_gpmp2_cost_composite(
 
     cost_composite = CostComposite(
         robot, n_support_points, cost_func_list,
+        weights_cost_l=weights_cost_list,
         tensor_args=tensor_args
     )
     return cost_composite
 
-
-class GPMP2(OptimizationPlanner):
-
-    def __init__(
+def __init__(
             self,
             robot=None,
             n_dof: int = None,
@@ -102,6 +101,7 @@ class GPMP2(OptimizationPlanner):
             dt: float = None,
             start_state: torch.Tensor = None,
             step_size=1.,
+            collision_focusing=False,
             multi_goal_states=None,
             initial_particle_means=None,
             sigma_start_init=None,
@@ -110,7 +110,7 @@ class GPMP2(OptimizationPlanner):
             sigma_goal_sample=None,
             sigma_gp_init=None,
             solver_params=None,
-            stop_criteria=None,  # or None
+            stop_criteria=None, 
             **kwargs
     ):
         super(GPMP2, self).__init__(
@@ -156,14 +156,15 @@ class GPMP2(OptimizationPlanner):
         ##############################################
         # Construct cost function
         self.cost = build_gpmp2_cost_composite(
-            robot=robot,
-            n_support_points=n_support_points,
-            dt=dt,
-            start_state=start_state,
-            multi_goal_states=multi_goal_states,
-            num_particles_per_goal=num_particles_per_goal,
-            **kwargs
-        )
+                        robot=robot,
+                        n_support_points=n_support_points,
+                        dt=dt,
+                        collision_focusing=collision_focusing,
+                        start_state=start_state,
+                        multi_goal_states=multi_goal_states,
+                        num_particles_per_goal=num_particles_per_goal,
+                        **kwargs
+                    )
 
         ##############################################
         # Initialize particles
@@ -278,19 +279,21 @@ class GPMP2(OptimizationPlanner):
     ):
         if opt_iters is None:
             opt_iters = self.opt_iters
+    
+        with TimerCUDA() as t:
+            for opt_step in range(opt_iters):
+                b, K = self._step(debug=debug, **observation)
 
-        for opt_step in range(opt_iters):
-            b, K = self._step(debug=debug, **observation)
-
-            # stop criteria
-            if self.stop_criteria is not None:
-                costs = self._get_costs(b, K)
-                if opt_step == 0:
+                # stop criteria
+                if self.stop_criteria is not None:
+                    costs = self._get_costs(b, K)
+                    if opt_step == 0:
+                        costs_previous = costs.clone()
+                        continue
+                    if torch.all(torch.abs((costs - costs_previous)/costs) < self.stop_criteria):
+                        break
                     costs_previous = costs.clone()
-                    continue
-                if torch.all(torch.abs((costs - costs_previous)/costs) < self.stop_criteria):
-                    break
-                costs_previous = costs.clone()
+
 
         self.costs = self._get_costs(b, K)
 
@@ -303,14 +306,13 @@ class GPMP2(OptimizationPlanner):
 
         # get mean trajectory
         curr_traj = self._get_traj()
-        return curr_traj
+        return curr_traj, t.elapsed
 
     def _step(self, debug=False, **observation):
-        with TimerCUDA() as t_grad:
-            A, b, K = self.cost.get_linear_system(
-                self._particle_means,
-                n_interpolated_points=self.n_interpolated_points,
-                **observation)
+        A, b, K = self.cost.get_linear_system(
+            self._particle_means,
+            n_interpolated_points=self.n_interpolated_points,
+            **observation)
         # if debug:
         #     print(f't_grad {t_grad}')
 
@@ -322,13 +324,10 @@ class GPMP2(OptimizationPlanner):
             sparse_computation_block_diag=self.solver_params.get('sparse_computation_block_diag', False)
         )
 
-        with TimerCUDA() as t_solve:
-            d_theta = self.get_torch_solve(
-                J_t_J, g,
-                method=self.solver_params['method'],
-            )
-        # if debug:
-        #     print(f't_solve {t_solve}')
+        d_theta = self.get_torch_solve(
+            J_t_J, g,
+            method=self.solver_params['method'],
+        )
 
         d_theta = d_theta.view(
                 self.num_particles,

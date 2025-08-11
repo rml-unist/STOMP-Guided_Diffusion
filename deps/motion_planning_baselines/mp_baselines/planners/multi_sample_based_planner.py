@@ -20,6 +20,7 @@ class MultiSampleBasedPlanner:
             self.multi_processer = MultiProcessor(**kwargs)
 
     def optimize(self, **kwargs):
+        return_stat = kwargs['return_stat']
         if self.multi_processer is not None:
             # optimize in parallel
             for p in self.planners_l:  # queue up multiple tasks
@@ -31,6 +32,10 @@ class MultiSampleBasedPlanner:
             for _ in range(self.n_trajectories):  # queue up multiple tasks
                 traj = self.planner.optimize(**kwargs)
                 trajs_l.append(traj)
+
+        if return_stat:
+            trajs_final, times = zip(*trajs_l)
+            return trajs_final, sum(times)/len(times)
         return trajs_l
 
     @property

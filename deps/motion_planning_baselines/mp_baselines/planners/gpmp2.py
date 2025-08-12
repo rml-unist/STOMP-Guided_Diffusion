@@ -90,7 +90,8 @@ def build_gpmp2_cost_composite(
     )
     return cost_composite
 
-def __init__(
+class GPMP2(OptimizationPlanner)
+    def __init__(
             self,
             robot=None,
             n_dof: int = None,

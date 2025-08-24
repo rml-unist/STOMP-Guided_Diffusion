@@ -242,8 +242,10 @@ class GaussianDiffusionModel(nn.Module, ABC):
         batch_size = shape[0]
 
         # times = torch.tensor([0]*n_diffusion_steps_without_noise + [0, 2, 4, 6, 8, 10, 12, 14, 16, 20, 24], device=device)
-        times = torch.tensor(list(range(self.n_diffusion_steps, 0, -time_jump), device=device) + [0]*n_diffusion_steps_without_noise, device=device)
+        # times = torch.tensor(list(range(self.n_diffusion_steps-1, -1, -time_jump)) + [0]*n_diffusion_steps_without_noise, device=device)
+        times = torch.tensor([24, 20, 18, 16, 14, 12, 10, 6, 2] + [0]*n_diffusion_steps_without_noise, device=device)
         time_pairs = list(zip(times[:-1], times[1:]))
+        total_step_num = len(times)
 
         if init_structured_noise:
             x = sampler.sample((shape[0],)).reshape(shape)
@@ -259,11 +261,11 @@ class GaussianDiffusionModel(nn.Module, ABC):
             sqrt_one_minus_alpha_cumprod = extract(self.sqrt_one_minus_alphas_cumprod, t, x.shape)
 
             x, values = noise_ddim_sample_fn(self, x, hard_conds, context, t, alpha_next,
-                                noise_scale=sqrt_one_minus_alpha_cumprod, 
+                                noise_scale=sqrt_one_minus_alpha_cumprod,
                                 x0=x0,
                                 sampler=sampler,
                                 structured_noise=structured_noise,
-                                eta=0, # DDIM
+                                eta=1.0, # DDIM
                                 **sample_kwargs)
             
             if recurrencing and time < 2:

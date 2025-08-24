@@ -241,12 +241,13 @@ def noise_ddim_sample_fn(
 
     pred_noise = model.model(x, t, context)
     batch, traj_len, state_dim = pred_noise.shape
-    multi_shape = (sample_num, batch, traj_len, state_dim)
     # gradient_free_guide_ver = kwargs['gradient_free_guide_ver']
 
     if gradient_free_guide_ver is not None:
         model_mean, _, _, _ = model.p_mean_variance(x=x, noise=pred_noise, hard_conds=hard_conds, context=context, t=t)
-        
+        sample_num = max(int(sample_num * (1 - t_single/model.n_diffusion_steps)), 2)
+        multi_shape = (sample_num, batch, traj_len, state_dim)
+
         # Efficient batch sampling of direction with log probability computation
         direction = sampler.sample(multi_shape[:-2])
         # direction_logprob = sampler.log_prob(direction)
@@ -300,7 +301,7 @@ def noise_ddim_sample_fn(
         return alpha_next.sqrt() * x_recon + (1-alpha_next).sqrt() * noise, x_recon
 
     cur_next_ratio = (1-noise_scale**2)/alpha_next
-    model_std = eta * (torch.sqrt(1-alpha_next) / noise_scale) * torch.sqrt(1 - cur_next_ratio) # Non Markovian DDPM
+    model_std = eta * (torch.sqrt(1-alpha_next) / noise_scale) * torch.sqrt(1-cur_next_ratio) # Non Markovian DDPM
     model_variance = model_std**2
 
     c_square = torch.clamp(1 - alpha_next - model_variance, min=0) if t_single > 1 else torch.zeros_like(model_variance) # Non Markovian DDPM

@@ -583,6 +583,7 @@ def experiment(
             n_first_steps = 10
             n_last_steps = 10
             
+            traj_num, _, _ = trajs_final_free.shape
             trajs_pos = robot.get_position(trajs_final_free).movedim(1, 0)          
             trajs_vel = robot.get_velocity(trajs_final_free).movedim(1, 0)
 
@@ -605,7 +606,8 @@ def experiment(
             motion_planning_controller = MotionPlanningController(motion_planning_isaac_env)
             collision_free_idxs = motion_planning_controller.run_trajectories(
                                     trajs_pos,
-                                    start_states_joint_pos=trajs_pos[0], goal_state_joint_pos=trajs_pos[-1][0],
+                                    start_states_joint_pos=start_state_pos.view(1, -1).expand(traj_num, -1),
+                                    goal_state_joint_pos=goal_state_pos,
                                     n_first_steps=n_first_steps,
                                     n_last_steps=n_last_steps,
                                     visualize=True,

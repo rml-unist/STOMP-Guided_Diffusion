@@ -234,7 +234,7 @@ class GaussianDiffusionModel(nn.Module, ABC):
         structured_noise=False,
         sampler=None,
         x0=True,
-        time_jump=3,
+        time_jump=2,
         **sample_kwargs
     ):
     
@@ -242,8 +242,9 @@ class GaussianDiffusionModel(nn.Module, ABC):
         batch_size = shape[0]
 
         # times = torch.tensor([0]*n_diffusion_steps_without_noise + [0, 2, 4, 6, 8, 10, 12, 14, 16, 20, 24], device=device)
-        # times = torch.tensor(list(range(self.n_diffusion_steps-1, -1, -time_jump)) + [0]*n_diffusion_steps_without_noise, device=device)
-        times = torch.tensor([24, 20, 18, 16, 14, 12, 10, 6, 2] + [0]*n_diffusion_steps_without_noise, device=device)
+        # times = torch.tensor(list(range(self.n_diffusion_steps-1, -1, -time_jump)) + [0]*(n_diffusion_steps_without_noise), device=device)
+        times = torch.tensor([24, 20, 18, 17, 16, 15, 14, 12, 10, 6, 3] + [0]*n_diffusion_steps_without_noise, device=device)
+        # times = torch.tensor([24, 20, 18, 16, 14, 10, 5,] + [0]*n_diffusion_steps_without_noise, device=device)
         time_pairs = list(zip(times[:-1], times[1:]))
         total_step_num = len(times)
 
@@ -253,7 +254,7 @@ class GaussianDiffusionModel(nn.Module, ABC):
             x = torch.randn(shape, device=device)
         chain = [x] if return_chain else None
 
-        for time, time_next in time_pairs:
+        for i, (time, time_next) in enumerate(time_pairs):
             t = make_timesteps(batch_size, time, device)
             t_next = make_timesteps(batch_size, time_next, device)
 

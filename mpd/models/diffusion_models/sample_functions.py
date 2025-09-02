@@ -245,7 +245,7 @@ def noise_ddim_sample_fn(
 
     if gradient_free_guide_ver is not None:
         model_mean, _, _, _ = model.p_mean_variance(x=x, noise=pred_noise, hard_conds=hard_conds, context=context, t=t)
-        sample_num = max(int(sample_num * (1 - t_single/model.n_diffusion_steps)), 2)
+        # sample_num = max(int(sample_num * (1 - t_single/25)), 3) # 3 : 2D, 6 : Robot arm
         multi_shape = (sample_num, batch, traj_len, state_dim)
 
         # Efficient batch sampling of direction with log probability computation
